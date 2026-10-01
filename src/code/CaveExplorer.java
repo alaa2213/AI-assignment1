@@ -1,8 +1,10 @@
 package code;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public class CaveExplorer extends GenericSearchProblem {
@@ -68,10 +70,13 @@ public class CaveExplorer extends GenericSearchProblem {
             successors.add(new SearchTreeNode(nextState, node, "climbdown", node.getPathCost() + 1, node.getDepth() + 1));
         }
 
-        // 5. jumpdown: move 1 cell DOWN, costs 1 life, 0 energy, 0 rope
-        if (y < h - 1 && grid[y + 1][x] > 0 && currentState.getLives() > 1) {
+        // 5. jumpdown: move 1 cell DOWN, costs 1 life and the destination energy, 0 rope
+        if (y < h - 1 && grid[y + 1][x] > 0
+                && currentState.getEnergy() >= grid[y + 1][x]
+                && currentState.getLives() > 1) {
             State nextState = new State(currentState);
             nextState.setAgentY(y + 1);
+            nextState.setEnergy(nextState.getEnergy() - grid[y + 1][x]);
             nextState.setLives(nextState.getLives() - 1);
             successors.add(new SearchTreeNode(nextState, node, "jumpdown", node.getPathCost() + 1, node.getDepth() + 1));
         }
@@ -154,8 +159,98 @@ public class CaveExplorer extends GenericSearchProblem {
     }
 
     private static String genericSearch(GenericSearchProblem problem, String strategy) {
-        // Placeholder for the actual search algorithms (Uniform Cost, Iterative Deepening, A*)
-        // Returns dummy string matching "plan; lives; energy; nodes"
-        return "right,collect,unlock;1;65;272";
+        if ("ID".equals(strategy)) {
+            return iterativeDeepeningSearch(problem);
+        }
+        return "No Solution";
+    }
+
+    // Iterative deepening repeats depth-limited DFS, preserving the first shallowest plan.
+    private static String iterativeDeepeningSearch(GenericSearchProblem problem) {
+        SearchTreeNode root = new SearchTreeNode(problem.getInitialState(), null, "", 0, 0);
+        int nodesExpanded = 0;
+
+        for (int depthLimit = 0; ; depthLimit++) {
+            Set<State> pathStates = new HashSet<>();
+            Map<State, Integer> bestRemainingDepth = new HashMap<>();
+            SearchResult result = depthLimitedSearch(problem, root, depthLimit,
+                    pathStates, bestRemainingDepth);
+            nodesExpanded += result.nodesExpanded;
+            if (result.goal != null) {
+                return formatSolution(result.goal, nodesExpanded);
+            }
+            if (result.exhausted) {
+                return "No Solution";
+            }
+        }
+    }
+
+    private static SearchResult depthLimitedSearch(GenericSearchProblem problem,
+                                                   SearchTreeNode node,
+                                                   int remainingDepth,
+                                                   Set<State> pathStates,
+                                                   Map<State, Integer> bestRemainingDepth) {
+        SearchResult result = new SearchResult();
+        if (problem.isGoal(node.getState())) {
+            result.goal = node;
+            return result;
+        }
+        if (remainingDepth == 0) {
+            result.exhausted = false;
+            return result;
+        }
+        Integer previousDepth = bestRemainingDepth.get(node.getState());
+        if (previousDepth != null && previousDepth >= remainingDepth) {
+            return result;
+        }
+        bestRemainingDepth.put(node.getState(), remainingDepth);
+
+        pathStates.add(node.getState());
+        boolean reachedCutoff = false;
+        for (SearchTreeNode successor : problem.getSuccessors(node)) {
+            if (pathStates.contains(successor.getState())) {
+                continue;
+            }
+            SearchResult childResult = depthLimitedSearch(problem, successor,
+                    remainingDepth - 1, pathStates, bestRemainingDepth);
+            result.nodesExpanded += childResult.nodesExpanded + 1;
+            if (childResult.goal != null) {
+                pathStates.remove(node.getState());
+                result.goal = childResult.goal;
+                return result;
+            }
+            reachedCutoff |= !childResult.exhausted;
+        }
+        pathStates.remove(node.getState());
+        result.exhausted = !reachedCutoff;
+        return result;
+    }
+
+    private static String formatSolution(SearchTreeNode goal, int nodesExpanded) {
+        List<String> actions = new ArrayList<>();
+        SearchTreeNode current = goal;
+        while (current.getParent() != null) {
+            actions.add(0, current.getAction());
+            current = current.getParent();
+        }
+        State initialState = current.getState();
+        State goalState = goal.getState();
+        int livesUsed = initialState.getLives() - goalState.getLives();
+        int energyUsed = initialState.getEnergy() - goalState.getEnergy();
+        return String.join(",", actions) + ";" + livesUsed + ";" + energyUsed + ";" + nodesExpanded;
+    }
+
+    private static class SearchResult {
+        private SearchTreeNode goal;
+        private int nodesExpanded;
+        private boolean exhausted = true;
+    }
+
+public static void main(String[] args) {
+       String cave =
+    "1,3;0,0;5,0;1,1,1;2,0;1,0;";
+
+String result = CaveExplorer.solve(cave, "ID");
+System.out.println(result);
     }
 }
