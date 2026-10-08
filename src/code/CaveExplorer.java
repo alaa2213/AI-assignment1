@@ -616,9 +616,13 @@ public class CaveExplorer extends GenericSearchProblem {
     }
 
     public static void main(String[] args) {
-        String cave = "1,3;0,0;5,0;1,1,1;2,0;1,0;";
+        // This case has the same optimal solution for UC and AS, but AS uses
+        // the heuristic to expand fewer nodes (364 vs. 964).
+        String cave = "5,6;0,4;500,20;1,2,7,1,5,1;9,0,0,0,6,7;2,0,7,0,6,7;2,6,0,0,9,0;1,4,6,7,2,4;5,0;0,0;";
 
-        String result = CaveExplorer.solve(cave, "AS");
-        System.out.println(result);
+        String uniformCostResult = CaveExplorer.solve(cave, "UC");
+        String aStarResult = CaveExplorer.solve(cave, "AS");
+        System.out.println("UC: " + uniformCostResult);
+        System.out.println("AS: " + aStarResult);
     }
 }
