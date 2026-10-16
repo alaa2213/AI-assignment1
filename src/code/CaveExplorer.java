@@ -1,13 +1,17 @@
 package code;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.function.ToIntFunction;
 
 public class CaveExplorer extends GenericSearchProblem {
 
@@ -127,10 +131,10 @@ public class CaveExplorer extends GenericSearchProblem {
         return successors;
     }
 
-    public static String solve(String caveSystem, String strategy) {
+    public static String solve(String initString, String strategy) {
         // Split with limit -1 to preserve trailing empty values in case there are no
         // keys or doors
-        String[] parts = caveSystem.split(";", -1);
+        String[] parts = initString.split(";", -1);
 
         // Parse H,W
         String[] hw = parts[0].split(",");
@@ -196,68 +200,68 @@ public class CaveExplorer extends GenericSearchProblem {
     //     QING-FUN(nodes, children)
     //   return failure
     //
-    // Each concrete strategy (BFS, UC, A*) is an instantiation of this template
-    // with a different queuing function supplied via the Frontier interface.
+    // Each concrete strategy (UC, A*, depth-limited DFS used by ID) is an
+    // instantiation of this single template with a different queuing function
+    // supplied via the Frontier interface. Iterative deepening simply calls the
+    // template repeatedly with an increasing depth limit, exactly as in the lecture
+    // (ID-SEARCH calls DL-SEARCH, which is GENERAL-SEARCH with ENQUEUE-AT-FRONT
+    // and a depth cutoff).
     // -------------------------------------------------------------------------
 
     /**
      * A Frontier encapsulates the queuing function (QING-FUN from the lecture).
-     * Different strategies supply different implementations.
+     * Different strategies supply different implementations. Each frontier also
+     * does repeated-state elimination itself (see DominanceTable), so add() may
+     * silently reject a node that is no better than one already seen.
      */
     private interface Frontier {
         /** Add a child node to the frontier (QING-FUN's insertion logic). */
         void add(SearchTreeNode node);
+
         /** Remove and return the next node to expand (REMOVE-FIRST). */
         SearchTreeNode removeFirst();
-        /** True when the frontier is empty. */
+
+        /** True when the frontier is empty (outdated nodes are dropped first). */
         boolean isEmpty();
-        /** True if the frontier already contains a better or equal copy of this state. */
-        boolean containsBetterOrEqual(SearchTreeNode node);
     }
 
     /**
      * The single generic search loop, parameterised by the Frontier (QING-FUN).
-     * Explored-set-based repeated-state elimination is applied here; strategies
-     * that need finer control (ID, AS) override containsBetterOrEqual.
      *
-     * @param problem  the search problem
-     * @param frontier the queuing strategy
-     * @return solution string or "No Solution"
+     * @return a SearchResult whose goal is null if the search failed
      */
-    private static String genericSearch(GenericSearchProblem problem, Frontier frontier) {
-        // MAKE-NODE(INIT-STATE(problem))
-        SearchTreeNode root = new SearchTreeNode(problem.getInitialState(), null, null, 0, 0, 0);
-        frontier.add(root);
+    private static SearchResult search(GenericSearchProblem problem, Frontier frontier) {
+        SearchResult result = new SearchResult();
 
-        // Explored set for repeated-state elimination
-        Set<State> explored = new HashSet<>();
-        int nodesExpanded = 0;
+        // MAKE-NODE(INIT-STATE(problem)) and MAKE-Q
+        frontier.add(new SearchTreeNode(problem.getInitialState(), null, null, 0, 0, 0));
 
         while (!frontier.isEmpty()) {
             // REMOVE-FIRST(nodes)
             SearchTreeNode node = frontier.removeFirst();
 
-            // Skip stale duplicates that a priority-queue strategy may have re-queued
-            if (!explored.add(node.getState())) {
-                continue;
-            }
-
             // GOAL-TEST(problem, STATE(node))
             if (problem.isGoal(node.getState())) {
-                return formatSolution(node, nodesExpanded);
+                result.goal = node;
+                return result;
             }
 
-            nodesExpanded++;
+            result.nodesExpanded++;
 
             // EXPAND(node, OPERATORS(problem)) then QING-FUN(nodes, children)
             for (SearchTreeNode child : problem.getSuccessors(node)) {
-                if (!explored.contains(child.getState()) && !frontier.containsBetterOrEqual(child)) {
-                    frontier.add(child);
-                }
+                frontier.add(child);
             }
         }
 
-        return "No Solution";
+        // return failure
+        return result;
+    }
+
+    /** Runs the generic search with the given frontier and formats the outcome. */
+    private static String genericSearch(GenericSearchProblem problem, Frontier frontier) {
+        SearchResult r = search(problem, frontier);
+        return r.goal == null ? "No Solution" : formatSolution(r.goal, r.nodesExpanded);
     }
 
     /**
@@ -265,80 +269,201 @@ public class CaveExplorer extends GenericSearchProblem {
      * Frontier (queuing function) and invoking the generic search loop.
      */
     private static String genericSearch(GenericSearchProblem problem, String strategy) {
+        Frontier frontier;
         switch (strategy) {
             case "UC":
-                return uniformCostSearch(problem);
+                // ORDERED-INSERT by g(n): fewest lives lost, then least energy
+                frontier = new PriorityFrontier(CaveExplorer::combinedCost);
+                break;
             case "ID":
                 return iterativeDeepeningSearch(problem);
             case "AS":
-                return aStarSearch(problem);
+                // ORDERED-INSERT by f(n) = g(n) + h(n)
+                frontier = new PriorityFrontier(n -> combinedCost(n) + calculateHeuristic(n.getState()));
+                break;
             default:
                 return "No Solution";
+        }
+        return genericSearch(problem, frontier);
+    }
+
+    /**
+     * Repeated-state elimination by DOMINANCE.
+     *
+     * Two nodes are "at the same place" when they share position, held key,
+     * remaining keys and remaining doors. Among those, node A dominates node B
+     * when A has at least as much energy, rope and lives (and, for depth-limited
+     * search, is no deeper). Anything B can still do, A can do at no higher cost,
+     * so B is useless and is rejected.
+     *
+     * Why this matters: energy and rope are part of the State, so without this
+     * rule "same cell with 1 less energy" counts as a brand-new state and the
+     * search explodes on large grids (especially when there is no solution).
+     *
+     * It also lets A* re-open a place when a strictly cheaper path to it is found
+     * (the cheaper node is not dominated, so it is accepted and the old, worse
+     * node is marked stale). This keeps A* optimal even though our heuristic is
+     * admissible but not consistent.
+     */
+    private static final class DominanceTable {
+        private final boolean useDepth;
+        private final Map<List<Object>, List<SearchTreeNode>> seen = new HashMap<>();
+
+        DominanceTable(boolean useDepth) {
+            this.useDepth = useDepth;
+        }
+
+        /** Everything in the state except the "resources" (energy, rope, lives). */
+        private static List<Object> placeOf(State s) {
+            return Arrays.asList(s.getAgentX(), s.getAgentY(), s.isHoldingKey(),
+                    s.getUncollectedKeys(), s.getLockedDoors());
+        }
+
+        /** True if a is at least as good as b in every resource. */
+        private boolean dominates(SearchTreeNode a, SearchTreeNode b) {
+            State sa = a.getState();
+            State sb = b.getState();
+            return sa.getEnergy() >= sb.getEnergy()
+                    && sa.getRopeLength() >= sb.getRopeLength()
+                    && sa.getLives() >= sb.getLives()
+                    && (!useDepth || a.getDepth() <= b.getDepth());
+        }
+
+        /**
+         * Records the node unless an existing node dominates it.
+         * Existing nodes that the new node dominates are forgotten (they become stale).
+         *
+         * @return true if the node was recorded (i.e. it is worth adding to the frontier)
+         */
+        boolean tryRecord(SearchTreeNode node) {
+            List<SearchTreeNode> nodesHere = seen.computeIfAbsent(placeOf(node.getState()), k -> new ArrayList<>());
+            for (SearchTreeNode old : nodesHere) {
+                if (dominates(old, node)) {
+                    return false;
+                }
+            }
+            nodesHere.removeIf(old -> dominates(node, old));
+            nodesHere.add(node);
+            return true;
+        }
+
+        /** True if this node was replaced by a better one after it entered the frontier. */
+        boolean isStale(SearchTreeNode node) {
+            List<SearchTreeNode> nodesHere = seen.get(placeOf(node.getState()));
+            if (nodesHere != null) {
+                for (SearchTreeNode n : nodesHere) {
+                    if (n == node) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
     }
 
     /**
-     * Entry wrapper used by UC so that equal-cost nodes leave the priority
-     * queue in FIFO order, making the search deterministic.
+     * Entry wrapper for the priority queue. The priority is computed ONCE when the
+     * node is inserted (so the heuristic is not recomputed on every comparison),
+     * and equal priorities leave in FIFO order, making the search deterministic.
      */
     private static final class FrontierEntry {
         final SearchTreeNode node;
+        final int priority;
         final long order; // insertion sequence number
 
-        FrontierEntry(SearchTreeNode node, long order) {
+        FrontierEntry(SearchTreeNode node, int priority, long order) {
             this.node = node;
+            this.priority = priority;
             this.order = order;
         }
     }
 
     /**
-     * Uniform Cost Search (QING-FUN = insert into priority queue ordered by cost).
-     *
-     * The optimality criterion is lexicographic: minimise lives lost first,
-     * then minimise energy spent. Ties are broken by insertion order (FIFO).
-     * Because every action has a non-negative cost, the first goal node dequeued
-     * is guaranteed to be optimal.
+     * ORDERED-INSERT frontier shared by UC and A*. The only difference between
+     * the two strategies is the priority function passed in:
+     *   UC: g(n)           A*: g(n) + h(n)
      */
-    private static String uniformCostSearch(GenericSearchProblem problem) {
-        long insertionCounter = 0;
-
-        // Priority queue: lowest lives first, then lowest energy, then insertion order.
-        PriorityQueue<FrontierEntry> frontier = new PriorityQueue<>(
-                Comparator.comparingInt((FrontierEntry e) -> e.node.getLivesLost())
-                        .thenComparingInt(e -> e.node.getPathCost())
+    private static final class PriorityFrontier implements Frontier {
+        private final PriorityQueue<FrontierEntry> queue = new PriorityQueue<>(
+                Comparator.comparingInt((FrontierEntry e) -> e.priority)
                         .thenComparingLong(e -> e.order));
+        private final DominanceTable table = new DominanceTable(false);
+        private final ToIntFunction<SearchTreeNode> priorityOf;
+        private long insertionCounter;
 
-        // Explored set for repeated-state elimination.
-        Set<State> explored = new HashSet<>();
+        PriorityFrontier(ToIntFunction<SearchTreeNode> priorityOf) {
+            this.priorityOf = priorityOf;
+        }
 
-        SearchTreeNode root = new SearchTreeNode(problem.getInitialState(), null, null, 0, 0, 0);
-        frontier.add(new FrontierEntry(root, insertionCounter++));
-
-        int nodesExpanded = 0;
-
-        while (!frontier.isEmpty()) {
-            SearchTreeNode node = frontier.poll().node;
-
-            // A state may be queued several times; expand only the cheapest copy.
-            if (!explored.add(node.getState())) {
-                continue;
-            }
-
-            // Goal test on expansion (not generation) -> guarantees optimality.
-            if (problem.isGoal(node.getState())) {
-                return formatSolution(node, nodesExpanded);
-            }
-
-            nodesExpanded++;
-
-            for (SearchTreeNode child : problem.getSuccessors(node)) {
-                if (!explored.contains(child.getState())) {
-                    frontier.add(new FrontierEntry(child, insertionCounter++));
-                }
+        @Override
+        public void add(SearchTreeNode node) {
+            if (table.tryRecord(node)) {
+                queue.add(new FrontierEntry(node, priorityOf.applyAsInt(node), insertionCounter++));
             }
         }
 
-        return "No Solution";
+        @Override
+        public SearchTreeNode removeFirst() {
+            return queue.remove().node;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            // Drop outdated nodes (a better node for the same place was found later)
+            while (!queue.isEmpty() && table.isStale(queue.peek().node)) {
+                queue.poll();
+            }
+            return queue.isEmpty();
+        }
+    }
+
+    /**
+     * Frontier for depth-limited DFS (the DL-SEARCH of the lecture): a LIFO stack
+     * (ENQUEUE-AT-FRONT) that rejects nodes deeper than the limit.
+     *
+     * Repeated-state elimination is depth-aware: a node is only redundant if a node
+     * with at least the same resources was already reached at the same or a
+     * shallower depth. (Ignoring depth would wrongly block a place first reached
+     * deep in one branch from being re-expanded at a shallower depth.)
+     */
+    private static final class DepthLimitedFrontier implements Frontier {
+        private final Deque<SearchTreeNode> stack = new ArrayDeque<>();
+        private final DominanceTable table = new DominanceTable(true);
+        private final int limit;
+        private boolean cutoff = false; // true if any node was rejected for exceeding the limit
+
+        DepthLimitedFrontier(int limit) {
+            this.limit = limit;
+        }
+
+        /** True if some node was cut off, i.e. a deeper limit might still find a solution. */
+        boolean hitCutoff() {
+            return cutoff;
+        }
+
+        @Override
+        public void add(SearchTreeNode node) {
+            if (node.getDepth() > limit) {
+                cutoff = true;
+                return;
+            }
+            if (table.tryRecord(node)) {
+                stack.push(node);
+            }
+        }
+
+        @Override
+        public SearchTreeNode removeFirst() {
+            return stack.pop();
+        }
+
+        @Override
+        public boolean isEmpty() {
+            while (!stack.isEmpty() && table.isStale(stack.peek())) {
+                stack.pop();
+            }
+            return stack.isEmpty();
+        }
     }
 
     /**
@@ -357,62 +482,6 @@ public class CaveExplorer extends GenericSearchProblem {
      */
     private static int combinedCost(SearchTreeNode n) {
         return n.getLivesLost() * LIVES_PENALTY + n.getPathCost();
-    }
-
-    /**
-     * A* Search (QING-FUN = priority queue ordered by f(n) = g(n) + h(n)).
-     *
-     * g(n) = livesLost × LIVES_PENALTY + pathCost  (combined optimality cost)
-     * h(n) = admissible energy heuristic (see calculateHeuristic)
-     *
-     * Using a combined g(n) ensures A* respects the same lexicographic
-     * (lives, energy) optimality criterion as Uniform Cost Search.
-     * h(n) estimates remaining energy only; since lives_remaining × LIVES_PENALTY
-     * ≥ 0 ≥ h(n), admissibility w.r.t. the combined cost is preserved.
-     *
-     * A bestCost map tracks the lowest g(n) seen per state to discard stale
-     * duplicate nodes re-queued after a cheaper path was found.
-     */
-    private static String aStarSearch(GenericSearchProblem problem) {
-        // Priority queue ordered by f(n) = combinedCost(n) + h(n).
-        PriorityQueue<SearchTreeNode> pq = new PriorityQueue<>(
-                Comparator.comparingInt(n -> combinedCost(n) + calculateHeuristic(n.getState())));
-
-        // bestCost[state] = lowest combined g(n) seen so far for that state.
-        Map<State, Integer> bestCost = new HashMap<>();
-
-        SearchTreeNode root = new SearchTreeNode(problem.getInitialState(), null, null, 0, 0, 0);
-        pq.add(root);
-        bestCost.put(root.getState(), combinedCost(root));
-
-        int nodesExpanded = 0;
-
-        while (!pq.isEmpty()) {
-            SearchTreeNode current = pq.poll();
-
-            // Discard stale copies where a cheaper combined path was found later.
-            if (combinedCost(current) > bestCost.getOrDefault(current.getState(), Integer.MAX_VALUE)) {
-                continue;
-            }
-
-            // Goal test on expansion -> guarantees optimality.
-            if (problem.isGoal(current.getState())) {
-                return formatSolution(current, nodesExpanded);
-            }
-
-            nodesExpanded++;
-
-            for (SearchTreeNode successor : problem.getSuccessors(current)) {
-                int newCombined = combinedCost(successor);
-                // Only enqueue if we found a strictly cheaper combined path to this state.
-                if (newCombined < bestCost.getOrDefault(successor.getState(), Integer.MAX_VALUE)) {
-                    bestCost.put(successor.getState(), newCombined);
-                    pq.add(successor);
-                }
-            }
-        }
-
-        return "No Solution";
     }
 
     /**
@@ -529,73 +598,27 @@ public class CaveExplorer extends GenericSearchProblem {
     /**
      * Iterative Deepening Search (ID).
      *
-     * Repeatedly runs a depth-limited DFS with an increasing depth limit.
-     * Combines the space efficiency of DFS with the completeness guarantee
-     * of BFS — finds the shallowest solution first.
+     * Mirrors the lecture's ID-SEARCH: for depth = 0, 1, 2, ... run a depth-limited
+     * search (DL-SEARCH) until it succeeds. Each DL-SEARCH is the SAME generic
+     * search loop used by UC and A*, instantiated with a depth-limited LIFO
+     * frontier. Node counts are accumulated across all iterations.
      *
-     * Repeated-state elimination: within a single DL-DFS pass we track the
-     * current path (to avoid cycles) AND a bestRemainingDepth map so that we
-     * skip re-visiting a state we have already visited with >= remaining budget.
+     * If an iteration finishes without any node being cut off by the limit, the
+     * whole reachable state space was exhausted, so no solution exists.
      */
     private static String iterativeDeepeningSearch(GenericSearchProblem problem) {
-        // Root node — no parent, no action taken.
-        SearchTreeNode root = new SearchTreeNode(problem.getInitialState(), null, null, 0, 0, 0);
-        int nodesExpanded = 0;
-
-        for (int depthLimit = 0;; depthLimit++) {
-            Set<State> pathStates = new HashSet<>();         // States on the current path (cycle check)
-            Map<State, Integer> bestRemainingDepth = new HashMap<>(); // Best remaining depth seen per state
-            SearchResult result = depthLimitedSearch(problem, root, depthLimit,
-                    pathStates, bestRemainingDepth);
-            nodesExpanded += result.nodesExpanded;
-            if (result.goal != null) {
-                return formatSolution(result.goal, nodesExpanded);
+        int totalNodes = 0;
+        for (int limit = 0;; limit++) {
+            DepthLimitedFrontier frontier = new DepthLimitedFrontier(limit);
+            SearchResult r = search(problem, frontier);
+            totalNodes += r.nodesExpanded;
+            if (r.goal != null) {
+                return formatSolution(r.goal, totalNodes);
             }
-            if (result.exhausted) {
-                return "No Solution"; // Entire state space exhausted — no solution exists.
+            if (!frontier.hitCutoff()) {
+                return "No Solution";
             }
         }
-    }
-
-    private static SearchResult depthLimitedSearch(GenericSearchProblem problem,
-            SearchTreeNode node,
-            int remainingDepth,
-            Set<State> pathStates,
-            Map<State, Integer> bestRemainingDepth) {
-        SearchResult result = new SearchResult();
-        if (problem.isGoal(node.getState())) {
-            result.goal = node;
-            return result;
-        }
-        if (remainingDepth == 0) {
-            result.exhausted = false;
-            return result;
-        }
-        Integer previousDepth = bestRemainingDepth.get(node.getState());
-        if (previousDepth != null && previousDepth >= remainingDepth) {
-            return result;
-        }
-        bestRemainingDepth.put(node.getState(), remainingDepth);
-
-        pathStates.add(node.getState());
-        boolean reachedCutoff = false;
-        for (SearchTreeNode successor : problem.getSuccessors(node)) {
-            if (pathStates.contains(successor.getState())) {
-                continue;
-            }
-            SearchResult childResult = depthLimitedSearch(problem, successor,
-                    remainingDepth - 1, pathStates, bestRemainingDepth);
-            result.nodesExpanded += childResult.nodesExpanded + 1;
-            if (childResult.goal != null) {
-                pathStates.remove(node.getState());
-                result.goal = childResult.goal;
-                return result;
-            }
-            reachedCutoff |= !childResult.exhausted;
-        }
-        pathStates.remove(node.getState());
-        result.exhausted = !reachedCutoff;
-        return result;
     }
 
     /**
@@ -609,20 +632,22 @@ public class CaveExplorer extends GenericSearchProblem {
         return goal.getPlan() + ";" + goal.getLivesLost() + ";" + goal.getPathCost() + ";" + nodesExpanded;
     }
 
+    /** Outcome of one run of the generic search loop (goal == null means failure). */
     private static class SearchResult {
         private SearchTreeNode goal;
         private int nodesExpanded;
-        private boolean exhausted = true;
     }
 
     public static void main(String[] args) {
         // This case has the same optimal solution for UC and AS, but AS uses
-        // the heuristic to expand fewer nodes (364 vs. 964).
+        // the heuristic to expand fewer nodes (18 vs. 27).
         String cave = "5,6;0,4;500,20;1,2,7,1,5,1;9,0,0,0,6,7;2,0,7,0,6,7;2,6,0,0,9,0;1,4,6,7,2,4;5,0;0,0;";
 
         String uniformCostResult = CaveExplorer.solve(cave, "UC");
         String aStarResult = CaveExplorer.solve(cave, "AS");
+        String idResult = CaveExplorer.solve(cave, "ID");
         System.out.println("UC: " + uniformCostResult);
         System.out.println("AS: " + aStarResult);
+        System.out.println("ID: " + idResult);
     }
 }
